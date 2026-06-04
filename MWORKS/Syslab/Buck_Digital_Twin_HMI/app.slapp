@@ -1,0 +1,793 @@
+{
+    "name": "Buck_Digital_Twin_HMI",
+    "callbackFunctions": [
+        {
+            "name": "Btn_StartPushedFcn",
+            "code": "            try\n                if !isdefined(app, :UserData) || !haskey(app.UserData, \"is_initialized\")\n                    app.UserData = Dict{String, Any}(\"is_initialized\" => false)\n                end\n\n                if !app.UserData[\"is_initialized\"]\n                    app.Btn_Start.Text = \"加载中...\" \n                    \n                    app.UserData[\"t_current\"] = 0.0\n                    app.UserData[\"dt_macro\"] = 0.01\n                    app.UserData[\"is_running\"] = false\n                    \n                    app.UserData[\"time_scale\"] = 1.0 \n                    app.UserData[\"K_acc\"] = 0.5 \n                    \n                    app.UserData[\"vars_in\"] = [\"Set_T_Env\", \"Set_R_Load\"]\n                    app.UserData[\"vars_out\"] = [\"SOH_C_Out\", \"SOH_L_Out\", \"SOH_Rc_Out\"]\n                    \n                    app.UserData[\"time_log\"] = Float64[]\n                    app.UserData[\"t_physical_log\"] = Float64[] \n                    app.UserData[\"C_log\"] = Float64[]\n                    app.UserData[\"L_log\"] = Float64[]\n                    app.UserData[\"Rc_log\"] = Float64[]\n                    \n                    fmu_path = joinpath(@__DIR__, \"Buck_Digital_Twin_System_Buck_Twin.fmu\")\n                    if !isfile(fmu_path)\n                        app.Btn_Start.Text = \"FMU路径丢失\" \n                        println(\"【致命错误】未找到 FMU 文件: \", fmu_path)\n                        return\n                    end\n\n                    app.UserData[\"fmu\"] = loadFMU(fmu_path)\n                    app.UserData[\"inst\"] = fmi2Instantiate!(app.UserData[\"fmu\"])\n                    \n                    inst = app.UserData[\"inst\"]\n                    fmi2SetupExperiment(inst, 0.0, 1e5) \n                    fmi2EnterInitializationMode(inst)\n                    fmi2SetReal(inst, app.UserData[\"vars_in\"], Float64[app.EditField_T.Value, app.EditField_R.Value])\n                    fmi2ExitInitializationMode(inst)\n                    \n                    app.UserData[\"is_initialized\"] = true\n                end\n\n                app.UserData[\"is_running\"] = !app.UserData[\"is_running\"]\n                \n                if app.UserData[\"is_running\"]\n                    app.Btn_Start.Text = \"暂停\"\n                    \n                    @async begin\n                        inst = app.UserData[\"inst\"]\n                        dt = app.UserData[\"dt_macro\"]\n                        vars_in = app.UserData[\"vars_in\"]\n                        vars_out = app.UserData[\"vars_out\"]\n                        \n                        T_real_0 = time()\n                        t_sim_0 = app.UserData[\"t_current\"]\n                        k_scale = app.UserData[\"time_scale\"]\n                        k_acc = app.UserData[\"K_acc\"]\n                        \n                        try\n                            while app.UserData[\"is_running\"]\n                                t = app.UserData[\"t_current\"]\n                                \n                                fmi2SetReal(inst, vars_in, Float64[app.EditField_T.Value, app.EditField_R.Value])\n                                status = fmi2DoStep(inst, t, dt, Int32(1))\n                                \n                                if status != 0\n                                    app.UserData[\"is_running\"] = false\n                                    app.Btn_Start.Text = \"解算发散\" \n                                    break\n                                end\n                                \n                                app.UserData[\"t_current\"] += dt\n                                res = fmi2GetReal(inst, vars_out)\n                                \n                                current_C_uF = res[1] * 1e6\n                                current_Rc_mOhm = res[3] * 1e3\n\n                                # 瞬态掩蔽逻辑 (消除0.1秒内的底层初始化跳变)\n                                t_sim = app.UserData[\"t_current\"]\n                                T_converge = 0.1  \n                                if t_sim < T_converge\n                                    weight = (T_converge - t_sim) / T_converge \n                                    current_C_uF = weight * 330.0 + (1.0 - weight) * current_C_uF\n                                    current_Rc_mOhm = weight * 25.0 + (1.0 - weight) * current_Rc_mOhm\n                                end\n\n                                push!(app.UserData[\"time_log\"], app.UserData[\"t_current\"])\n                                push!(app.UserData[\"t_physical_log\"], app.UserData[\"t_current\"] * k_acc)\n                                \n                                push!(app.UserData[\"C_log\"], current_C_uF)\n                                push!(app.UserData[\"L_log\"], res[2] * 1e3)\n                                push!(app.UserData[\"Rc_log\"], current_Rc_mOhm)\n                                \n                                # =========================================================\n                                # 报警系统\n                                # =========================================================\n                                \n                                # C\n                                if current_C_uF <= 313.5\n                                    app.Btn_Status_C.Text = \"故障\"\n                                    app.Btn_Status_C.BackgroundColor = [0.9, 0.2, 0.2] # 红色\n                                    app.Btn_Status_C.FontColor = [1.0, 1.0, 1.0]\n                                elseif current_C_uF <= 320.1\n                                    app.Btn_Status_C.Text = \"警告\"\n                                    app.Btn_Status_C.BackgroundColor = [1.0, 0.6, 0.0] # 橙色\n                                    app.Btn_Status_C.FontColor = [1.0, 1.0, 1.0]\n                                else\n                                    app.Btn_Status_C.Text = \"正常\"\n                                    app.Btn_Status_C.BackgroundColor = [0.1294, 0.7647, 0.4941] # 绿色\n                                    app.Btn_Status_C.FontColor = [1.0, 1.0, 1.0]\n                                end\n                                \n                                # 2. Rc\n                                if current_Rc_mOhm >= 50.0\n                                    app.Btn_Status_Rc.Text = \"故障\"\n                                    app.Btn_Status_Rc.BackgroundColor = [0.9, 0.2, 0.2] # 红色\n                                    app.Btn_Status_Rc.FontColor = [1.0, 1.0, 1.0]\n                                elseif current_Rc_mOhm >= 37.5\n                                    app.Btn_Status_Rc.Text = \"警告\"\n                                    app.Btn_Status_Rc.BackgroundColor = [1.0, 0.6, 0.0] # 橙色\n                                    app.Btn_Status_Rc.FontColor = [1.0, 1.0, 1.0]\n                                else\n                                    app.Btn_Status_Rc.Text = \"正常\"\n                                    app.Btn_Status_Rc.BackgroundColor = [0.1294, 0.7647, 0.4941] # 绿色\n                                    app.Btn_Status_Rc.FontColor = [1.0, 1.0, 1.0]\n                                end\n                                # =========================================================\n                                \n                                if length(app.UserData[\"time_log\"]) % 10 == 0\n                                    window_size = 500\n                                    start_idx = max(1, length(app.UserData[\"time_log\"]) - window_size)\n                                    \n                                    t_view = app.UserData[\"time_log\"][start_idx:end]\n                                    C_view = app.UserData[\"C_log\"][start_idx:end]\n                                    Rc_view = app.UserData[\"Rc_log\"][start_idx:end]\n                                    \n                                    TyPlot.plot(app.Axes1, t_view, C_view)\n                                    TyPlot.plot(app.Axes2, t_view, Rc_view)\n                                    \n                                    if isdefined(app, :EditField_EqTime)\n                                        app.EditField_EqTime.Value = round(app.UserData[\"t_physical_log\"][end], digits=3)\n                                    end\n                                end\n                                \n                                T_target = T_real_0 + (app.UserData[\"t_current\"] - t_sim_0) / k_scale\n                                sleep_duration = T_target - time()\n                                \n                                if sleep_duration > 0.0\n                                    sleep(sleep_duration)\n                                else\n                                    yield()\n                                end\n                            end\n                        catch e\n                            app.UserData[\"is_running\"] = false\n                            app.Btn_Start.Text = \"渲染崩溃\"\n                            println(\"【异步协程异常】: \", e)\n                        end\n                    end\n                else\n                    app.Btn_Start.Text = \"启动\"\n                end\n            catch err\n                app.Btn_Start.Text = \"系统错误\" \n                println(\"【主控线程异常】: \", err)\n            end"
+        },
+        {
+            "name": "Btn_ClosePushedFcn",
+            "code": "        # 1. 停止仿真循环\n            if haskey(app.UserData, \"is_running\")\n                app.UserData[\"is_running\"] = false\n                sleep(0.1) # 给异步协程 0.1s 的时间安全退出\n            end\n            \n            # 2. 释放底层的 C 指针\n            if app.UserData[\"is_initialized\"]\n                try\n                    fmi2FreeInstance!(app.UserData[\"inst\"])\n                    unloadFMU(app.UserData[\"fmu\"])\n                catch\n                end\n            end\n            \n            # 3. 销毁 App 窗口\n            TyAppDesigner.delete(app, app.UIFigure)    "
+        }
+    ],
+    "customPrivateFunctions": [],
+    "customPublicFunctions": [],
+    "customPrivateProperties": [],
+    "customPublicProperties": "        UserData::Dict{String, Any} = Dict{String, Any}(\"is_initialized\" => false)",
+    "userLoadedModule": "    using FMI\n    using TyPlot",
+    "figure": {
+        "id": "23F4EnIGUqoMPblDQKm58",
+        "state": {
+            "position": [
+                100,
+                100,
+                789,
+                602
+            ]
+        },
+        "callbackFcns": {},
+        "type": "figure",
+        "position": [
+            100,
+            100,
+            789,
+            602
+        ],
+        "name": "Syslab App",
+        "color": [
+            0.94,
+            0.94,
+            0.94
+        ],
+        "tag": "",
+        "children": [
+            {
+                "id": "pk0y4zzjk2rY2kGI7On8K",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "position": [
+                        356,
+                        31,
+                        400,
+                        260
+                    ],
+                    "title": "输出滤波电容连续老化特征 (C)"
+                },
+                "callbackFcns": {},
+                "type": "uiaxes",
+                "title": "输出滤波电容连续老化特征 (C)",
+                "data": [],
+                "xLabel": "",
+                "yLabel": "",
+                "legend": false,
+                "grid": false,
+                "hold": false,
+                "xLim": [
+                    0,
+                    1
+                ],
+                "xLimMode": "auto",
+                "yLim": [
+                    0,
+                    1
+                ],
+                "yLimMode": "auto",
+                "visible": true,
+                "contextMenu": [],
+                "position": [
+                    356,
+                    31,
+                    400,
+                    260
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "buttonDownFcn": "",
+                "tag": "",
+                "variableName": "Axes1"
+            },
+            {
+                "id": "Lq2tQBsysJiVR_I1lRLBx",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "position": [
+                        357,
+                        314,
+                        400,
+                        260
+                    ],
+                    "title": "电容等效串联电阻离散故障特征 (Rc)"
+                },
+                "callbackFcns": {},
+                "type": "uiaxes",
+                "title": "电容等效串联电阻离散故障特征 (Rc)",
+                "data": [],
+                "xLabel": "",
+                "yLabel": "",
+                "legend": false,
+                "grid": false,
+                "hold": false,
+                "xLim": [
+                    0,
+                    1
+                ],
+                "xLimMode": "auto",
+                "yLim": [
+                    0,
+                    1
+                ],
+                "yLimMode": "auto",
+                "visible": true,
+                "contextMenu": [],
+                "position": [
+                    357,
+                    314,
+                    400,
+                    260
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "buttonDownFcn": "",
+                "tag": "",
+                "variableName": "Axes2"
+            },
+            {
+                "id": "TiGrZ_kuP3s56TNfO-9uA",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "label": "环境温度 [℃]",
+                    "value": 25,
+                    "horizontalAlignment": "center",
+                    "position": [
+                        44,
+                        93,
+                        190,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "numericeditfield",
+                "label": "环境温度 [℃]",
+                "value": 25,
+                "limits": [
+                    "-Inf",
+                    "Inf"
+                ],
+                "placeholder": "",
+                "horizontalAlignment": "center",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    1,
+                    1,
+                    1
+                ],
+                "visible": true,
+                "editable": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    44,
+                    93,
+                    190,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "valueChangedFcn": "",
+                "tag": "",
+                "variableName": "EditField_T"
+            },
+            {
+                "id": "yIZOe1D1Cg19XzwUm_YHa",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "label": "负载电阻 [Ω]",
+                    "value": 1,
+                    "horizontalAlignment": "center",
+                    "position": [
+                        44,
+                        154,
+                        190,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "numericeditfield",
+                "label": "负载电阻 [Ω]",
+                "value": 1,
+                "limits": [
+                    "-Inf",
+                    "Inf"
+                ],
+                "placeholder": "",
+                "horizontalAlignment": "center",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    1,
+                    1,
+                    1
+                ],
+                "visible": true,
+                "editable": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    44,
+                    154,
+                    190,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "valueChangedFcn": "",
+                "tag": "",
+                "variableName": "EditField_R"
+            },
+            {
+                "id": "xP7GYXOyNBhRyXBQB51cj",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "启动",
+                    "buttonPushedFcn": "Btn_StartPushedFcn",
+                    "position": [
+                        103,
+                        470,
+                        100,
+                        32
+                    ]
+                },
+                "callbackFcns": {
+                    "buttonPushedFcn": "Btn_StartPushedFcn"
+                },
+                "type": "button",
+                "text": "启动",
+                "wordWrap": false,
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "icon": "",
+                "iconAlignment": "left",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    0.94,
+                    0.94,
+                    0.94
+                ],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    103,
+                    470,
+                    100,
+                    32
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "buttonPushedFcn": "Btn_StartPushedFcn",
+                "tag": "",
+                "variableName": "Btn_Start"
+            },
+            {
+                "id": "np1jsCw1mTDUbX_bc2UUT",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "安全退出",
+                    "buttonPushedFcn": "Btn_ClosePushedFcn",
+                    "position": [
+                        103,
+                        528,
+                        100,
+                        32
+                    ]
+                },
+                "callbackFcns": {
+                    "buttonPushedFcn": "Btn_ClosePushedFcn"
+                },
+                "type": "button",
+                "text": "安全退出",
+                "wordWrap": false,
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "icon": "",
+                "iconAlignment": "left",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    0.94,
+                    0.94,
+                    0.94
+                ],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    103,
+                    528,
+                    100,
+                    32
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "buttonPushedFcn": "Btn_ClosePushedFcn",
+                "tag": "",
+                "variableName": "Btn_Close"
+            },
+            {
+                "id": "eq6IikSy4aOGW3pg3hr0I",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "容值 [μF]",
+                    "position": [
+                        303,
+                        154,
+                        67,
+                        24
+                    ],
+                    "horizontalAlignment": "center",
+                    "verticalAlignment": "center",
+                    "wordWrap": false
+                },
+                "callbackFcns": {},
+                "type": "label",
+                "text": "容值 [μF]",
+                "interpreter": "none",
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "wordWrap": false,
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    303,
+                    154,
+                    67,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "tag": "",
+                "variableName": "yLabel_C"
+            },
+            {
+                "id": "KiZP6SQN4pvtTL7cD3Z-P",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "时间 [s]",
+                    "position": [
+                        536,
+                        267,
+                        63,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "label",
+                "text": "时间 [s]",
+                "interpreter": "none",
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "wordWrap": false,
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    536,
+                    267,
+                    63,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "tag": "",
+                "variableName": "xLabel_C"
+            },
+            {
+                "id": "fK3lp1agjKzo4c2y4r9NG",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "阻值 [mΩ]",
+                    "position": [
+                        303,
+                        443,
+                        67,
+                        24
+                    ],
+                    "horizontalAlignment": "center",
+                    "verticalAlignment": "center",
+                    "wordWrap": false
+                },
+                "callbackFcns": {},
+                "type": "label",
+                "text": "阻值 [mΩ]",
+                "interpreter": "none",
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "wordWrap": false,
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    303,
+                    443,
+                    67,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "tag": "",
+                "variableName": "yLabel_R",
+                "copySource": "Label",
+                "copyId": "qnBrRthN171t4_6mtuOxh"
+            },
+            {
+                "id": "An-RKQunSE3RB6LFqsyAp",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "时间 [s]",
+                    "position": [
+                        536,
+                        550,
+                        63,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "label",
+                "text": "时间 [s]",
+                "interpreter": "none",
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "wordWrap": false,
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    536,
+                    550,
+                    63,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "tag": "",
+                "variableName": "xLabel_R",
+                "copySource": "Label2",
+                "copyId": "fohmdNaDtckB46X5pWsGa"
+            },
+            {
+                "id": "tSSv47hKataXkWLf7DxCs",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "label": "等效运行时间 [年]",
+                    "horizontalAlignment": "center",
+                    "position": [
+                        58,
+                        396,
+                        190,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "numericeditfield",
+                "label": "等效运行时间 [年]",
+                "value": 0,
+                "limits": [
+                    "-Inf",
+                    "Inf"
+                ],
+                "placeholder": "",
+                "horizontalAlignment": "center",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    1,
+                    1,
+                    1
+                ],
+                "visible": true,
+                "editable": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    58,
+                    396,
+                    190,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "valueChangedFcn": "",
+                "tag": "",
+                "variableName": "EditField_EqTime"
+            },
+            {
+                "id": "WfkzPYP8RV6KcTxFxdcTd",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "正常",
+                    "position": [
+                        160,
+                        230,
+                        38,
+                        32
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "button",
+                "text": "正常",
+                "wordWrap": false,
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "icon": "",
+                "iconAlignment": "left",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    0.94,
+                    0.94,
+                    0.94
+                ],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    160,
+                    230,
+                    38,
+                    32
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "buttonPushedFcn": "",
+                "tag": "",
+                "variableName": "Btn_Status_C"
+            },
+            {
+                "id": "wzwjGg-9htpJugbm34TVe",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "正常",
+                    "position": [
+                        160,
+                        305,
+                        38,
+                        32
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "button",
+                "text": "正常",
+                "wordWrap": false,
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "icon": "",
+                "iconAlignment": "left",
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [
+                    0.94,
+                    0.94,
+                    0.94
+                ],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    160,
+                    305,
+                    38,
+                    32
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "buttonPushedFcn": "",
+                "tag": "",
+                "variableName": "Btn_Status_Rc"
+            },
+            {
+                "id": "ksSE2UZNxlTjKhQ0fOuI5",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "电容C",
+                    "position": [
+                        103,
+                        234,
+                        50,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "label",
+                "text": "电容C",
+                "interpreter": "none",
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "wordWrap": false,
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    103,
+                    234,
+                    50,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "tag": "",
+                "variableName": "Label_C"
+            },
+            {
+                "id": "lPnDaST_iGP2Nd9yTTSfc",
+                "pid": "23F4EnIGUqoMPblDQKm58",
+                "state": {
+                    "text": "电阻Rc",
+                    "position": [
+                        102,
+                        309,
+                        52,
+                        24
+                    ]
+                },
+                "callbackFcns": {},
+                "type": "label",
+                "text": "电阻Rc",
+                "interpreter": "none",
+                "horizontalAlignment": "center",
+                "verticalAlignment": "center",
+                "wordWrap": false,
+                "fontName": "Helvetica",
+                "fontSize": 12,
+                "fontWeight": "normal",
+                "fontAngle": "normal",
+                "fontColor": [
+                    0,
+                    0,
+                    0
+                ],
+                "backgroundColor": [],
+                "visible": true,
+                "enable": true,
+                "tooltip": "",
+                "contextMenu": [],
+                "position": [
+                    102,
+                    309,
+                    52,
+                    24
+                ],
+                "interruptible": false,
+                "busyAction": "queue",
+                "tag": "",
+                "variableName": "Label_R",
+                "copySource": "Label_C",
+                "copyId": "vkoSznvdWaPuINudXgK6-"
+            }
+        ],
+        "visible": true,
+        "variableName": "UIFigure"
+    },
+    "info": {
+        "name": "Buck_Digital_Twin_HMI",
+        "version": "1.0",
+        "author": "",
+        "description": "",
+        "icon": "",
+        "startupFcn": ""
+    },
+    "code": "module Buck_Digital_Twin_HMI\n    # Default loaded module\n    using TyAppDesigner\n    using ObjectOriented\n\n    # User loaded module and file\n    using FMI\n    using TyPlot\n\n    @oodef mutable struct App\n\n        # Properties that correspond to app components\n        UIFigure::TyAppDesigner.Figure = TyAppDesigner.create_figure()\n        Axes1::TyAppDesigner.UIAxes = TyAppDesigner.create_uiaxes()\n        Axes2::TyAppDesigner.UIAxes = TyAppDesigner.create_uiaxes()\n        EditField_T::TyAppDesigner.NumericEditField = TyAppDesigner.create_numericeditfield()\n        EditField_R::TyAppDesigner.NumericEditField = TyAppDesigner.create_numericeditfield()\n        Btn_Start::TyAppDesigner.Button = TyAppDesigner.create_button()\n        Btn_Close::TyAppDesigner.Button = TyAppDesigner.create_button()\n        yLabel_C::TyAppDesigner.Label = TyAppDesigner.create_label()\n        xLabel_C::TyAppDesigner.Label = TyAppDesigner.create_label()\n        yLabel_R::TyAppDesigner.Label = TyAppDesigner.create_label()\n        xLabel_R::TyAppDesigner.Label = TyAppDesigner.create_label()\n        EditField_EqTime::TyAppDesigner.NumericEditField = TyAppDesigner.create_numericeditfield()\n        Btn_Status_C::TyAppDesigner.Button = TyAppDesigner.create_button()\n        Btn_Status_Rc::TyAppDesigner.Button = TyAppDesigner.create_button()\n        Label_C::TyAppDesigner.Label = TyAppDesigner.create_label()\n        Label_R::TyAppDesigner.Label = TyAppDesigner.create_label()\n\n        # Appinfo\n        Appname::Module = @__MODULE__\n        Appfile::String = @__FILE__\n\n        # User custom functions\n\n\n        # User custom properties\n        UserData::Dict{String, Any} = Dict{String, Any}(\"is_initialized\" => false)\n\n        # Callbacks that handle component events\n\n        # Btn_StartPushedFcn function:Btn_Start\n        function Btn_StartPushedFcn(app,event)\n            try\n                if !isdefined(app, :UserData) || !haskey(app.UserData, \"is_initialized\")\n                    app.UserData = Dict{String, Any}(\"is_initialized\" => false)\n                end\n\n                if !app.UserData[\"is_initialized\"]\n                    app.Btn_Start.Text = \"加载中...\" \n                    \n                    app.UserData[\"t_current\"] = 0.0\n                    app.UserData[\"dt_macro\"] = 0.01\n                    app.UserData[\"is_running\"] = false\n                    \n                    app.UserData[\"time_scale\"] = 1.0 \n                    app.UserData[\"K_acc\"] = 0.5 \n                    \n                    app.UserData[\"vars_in\"] = [\"Set_T_Env\", \"Set_R_Load\"]\n                    app.UserData[\"vars_out\"] = [\"SOH_C_Out\", \"SOH_L_Out\", \"SOH_Rc_Out\"]\n                    \n                    app.UserData[\"time_log\"] = Float64[]\n                    app.UserData[\"t_physical_log\"] = Float64[] \n                    app.UserData[\"C_log\"] = Float64[]\n                    app.UserData[\"L_log\"] = Float64[]\n                    app.UserData[\"Rc_log\"] = Float64[]\n                    \n                    fmu_path = joinpath(@__DIR__, \"Buck_Digital_Twin_System_Buck_Twin.fmu\")\n                    if !isfile(fmu_path)\n                        app.Btn_Start.Text = \"FMU路径丢失\" \n                        println(\"【致命错误】未找到 FMU 文件: \", fmu_path)\n                        return\n                    end\n\n                    app.UserData[\"fmu\"] = loadFMU(fmu_path)\n                    app.UserData[\"inst\"] = fmi2Instantiate!(app.UserData[\"fmu\"])\n                    \n                    inst = app.UserData[\"inst\"]\n                    fmi2SetupExperiment(inst, 0.0, 1e5) \n                    fmi2EnterInitializationMode(inst)\n                    fmi2SetReal(inst, app.UserData[\"vars_in\"], Float64[app.EditField_T.Value, app.EditField_R.Value])\n                    fmi2ExitInitializationMode(inst)\n                    \n                    app.UserData[\"is_initialized\"] = true\n                end\n\n                app.UserData[\"is_running\"] = !app.UserData[\"is_running\"]\n                \n                if app.UserData[\"is_running\"]\n                    app.Btn_Start.Text = \"暂停\"\n                    \n                    @async begin\n                        inst = app.UserData[\"inst\"]\n                        dt = app.UserData[\"dt_macro\"]\n                        vars_in = app.UserData[\"vars_in\"]\n                        vars_out = app.UserData[\"vars_out\"]\n                        \n                        T_real_0 = time()\n                        t_sim_0 = app.UserData[\"t_current\"]\n                        k_scale = app.UserData[\"time_scale\"]\n                        k_acc = app.UserData[\"K_acc\"]\n                        \n                        try\n                            while app.UserData[\"is_running\"]\n                                t = app.UserData[\"t_current\"]\n                                \n                                fmi2SetReal(inst, vars_in, Float64[app.EditField_T.Value, app.EditField_R.Value])\n                                status = fmi2DoStep(inst, t, dt, Int32(1))\n                                \n                                if status != 0\n                                    app.UserData[\"is_running\"] = false\n                                    app.Btn_Start.Text = \"解算发散\" \n                                    break\n                                end\n                                \n                                app.UserData[\"t_current\"] += dt\n                                res = fmi2GetReal(inst, vars_out)\n                                \n                                current_C_uF = res[1] * 1e6\n                                current_Rc_mOhm = res[3] * 1e3\n\n                                # 瞬态掩蔽逻辑 (消除0.1秒内的底层初始化跳变)\n                                t_sim = app.UserData[\"t_current\"]\n                                T_converge = 0.1  \n                                if t_sim < T_converge\n                                    weight = (T_converge - t_sim) / T_converge \n                                    current_C_uF = weight * 330.0 + (1.0 - weight) * current_C_uF\n                                    current_Rc_mOhm = weight * 25.0 + (1.0 - weight) * current_Rc_mOhm\n                                end\n\n                                push!(app.UserData[\"time_log\"], app.UserData[\"t_current\"])\n                                push!(app.UserData[\"t_physical_log\"], app.UserData[\"t_current\"] * k_acc)\n                                \n                                push!(app.UserData[\"C_log\"], current_C_uF)\n                                push!(app.UserData[\"L_log\"], res[2] * 1e3)\n                                push!(app.UserData[\"Rc_log\"], current_Rc_mOhm)\n                                \n                                # =========================================================\n                                # 报警系统\n                                # =========================================================\n                                \n                                # C\n                                if current_C_uF <= 313.5\n                                    app.Btn_Status_C.Text = \"故障\"\n                                    app.Btn_Status_C.BackgroundColor = [0.9, 0.2, 0.2] # 红色\n                                    app.Btn_Status_C.FontColor = [1.0, 1.0, 1.0]\n                                elseif current_C_uF <= 320.1\n                                    app.Btn_Status_C.Text = \"警告\"\n                                    app.Btn_Status_C.BackgroundColor = [1.0, 0.6, 0.0] # 橙色\n                                    app.Btn_Status_C.FontColor = [1.0, 1.0, 1.0]\n                                else\n                                    app.Btn_Status_C.Text = \"正常\"\n                                    app.Btn_Status_C.BackgroundColor = [0.1294, 0.7647, 0.4941] # 绿色\n                                    app.Btn_Status_C.FontColor = [1.0, 1.0, 1.0]\n                                end\n                                \n                                # 2. Rc\n                                if current_Rc_mOhm >= 50.0\n                                    app.Btn_Status_Rc.Text = \"故障\"\n                                    app.Btn_Status_Rc.BackgroundColor = [0.9, 0.2, 0.2] # 红色\n                                    app.Btn_Status_Rc.FontColor = [1.0, 1.0, 1.0]\n                                elseif current_Rc_mOhm >= 37.5\n                                    app.Btn_Status_Rc.Text = \"警告\"\n                                    app.Btn_Status_Rc.BackgroundColor = [1.0, 0.6, 0.0] # 橙色\n                                    app.Btn_Status_Rc.FontColor = [1.0, 1.0, 1.0]\n                                else\n                                    app.Btn_Status_Rc.Text = \"正常\"\n                                    app.Btn_Status_Rc.BackgroundColor = [0.1294, 0.7647, 0.4941] # 绿色\n                                    app.Btn_Status_Rc.FontColor = [1.0, 1.0, 1.0]\n                                end\n                                # =========================================================\n                                \n                                if length(app.UserData[\"time_log\"]) % 10 == 0\n                                    window_size = 500\n                                    start_idx = max(1, length(app.UserData[\"time_log\"]) - window_size)\n                                    \n                                    t_view = app.UserData[\"time_log\"][start_idx:end]\n                                    C_view = app.UserData[\"C_log\"][start_idx:end]\n                                    Rc_view = app.UserData[\"Rc_log\"][start_idx:end]\n                                    \n                                    TyPlot.plot(app.Axes1, t_view, C_view)\n                                    TyPlot.plot(app.Axes2, t_view, Rc_view)\n                                    \n                                    if isdefined(app, :EditField_EqTime)\n                                        app.EditField_EqTime.Value = round(app.UserData[\"t_physical_log\"][end], digits=3)\n                                    end\n                                end\n                                \n                                T_target = T_real_0 + (app.UserData[\"t_current\"] - t_sim_0) / k_scale\n                                sleep_duration = T_target - time()\n                                \n                                if sleep_duration > 0.0\n                                    sleep(sleep_duration)\n                                else\n                                    yield()\n                                end\n                            end\n                        catch e\n                            app.UserData[\"is_running\"] = false\n                            app.Btn_Start.Text = \"渲染崩溃\"\n                            println(\"【异步协程异常】: \", e)\n                        end\n                    end\n                else\n                    app.Btn_Start.Text = \"启动\"\n                end\n            catch err\n                app.Btn_Start.Text = \"系统错误\" \n                println(\"【主控线程异常】: \", err)\n            end\n        end\n\n        # Btn_ClosePushedFcn function:Btn_Close\n        function Btn_ClosePushedFcn(app,event)\n        # 1. 停止仿真循环\n            if haskey(app.UserData, \"is_running\")\n                app.UserData[\"is_running\"] = false\n                sleep(0.1) # 给异步协程 0.1s 的时间安全退出\n            end\n            \n            # 2. 释放底层的 C 指针\n            if app.UserData[\"is_initialized\"]\n                try\n                    fmi2FreeInstance!(app.UserData[\"inst\"])\n                    unloadFMU(app.UserData[\"fmu\"])\n                catch\n                end\n            end\n            \n            # 3. 销毁 App 窗口\n            TyAppDesigner.delete(app, app.UIFigure)    \n        end\n\n        # Create UIFigure and components\n        function createComponents(app)\n            # Create UIFigure\n            app.UIFigure = TyAppDesigner.uifigure(Visible=false)\n            app.UIFigure.Position = [100,100,789,602]\n            app.UIFigure.Name = raw\"Syslab App\"\n\n            # Create Axes1\n            app.Axes1 = TyAppDesigner.uiaxes(app.UIFigure)\n            app.Axes1.Position = [356,31,400,260]\n            app.Axes1.Title = raw\"输出滤波电容连续老化特征 (C)\"\n\n            # Create Axes2\n            app.Axes2 = TyAppDesigner.uiaxes(app.UIFigure)\n            app.Axes2.Position = [357,314,400,260]\n            app.Axes2.Title = raw\"电容等效串联电阻离散故障特征 (Rc)\"\n\n            # Create EditField_T\n            app.EditField_T = TyAppDesigner.uinumericeditfield(app.UIFigure)\n            app.EditField_T.Position = [44,93,190,24]\n            app.EditField_T.Label = raw\"环境温度 [℃]\"\n            app.EditField_T.Value = 25\n            app.EditField_T.HorizontalAlignment = raw\"center\"\n\n            # Create EditField_R\n            app.EditField_R = TyAppDesigner.uinumericeditfield(app.UIFigure)\n            app.EditField_R.Position = [44,154,190,24]\n            app.EditField_R.Label = raw\"负载电阻 [Ω]\"\n            app.EditField_R.Value = 1\n            app.EditField_R.HorizontalAlignment = raw\"center\"\n\n            # Create Btn_Start\n            app.Btn_Start = TyAppDesigner.uibutton(app.UIFigure)\n            app.Btn_Start.Position = [103,470,100,32]\n            app.Btn_Start.Text = raw\"启动\"\n            app.Btn_Start.ButtonPushedFcn = raw\"Btn_StartPushedFcn\"\n\n            # Create Btn_Close\n            app.Btn_Close = TyAppDesigner.uibutton(app.UIFigure)\n            app.Btn_Close.Position = [103,528,100,32]\n            app.Btn_Close.Text = raw\"安全退出\"\n            app.Btn_Close.ButtonPushedFcn = raw\"Btn_ClosePushedFcn\"\n\n            # Create yLabel_C\n            app.yLabel_C = TyAppDesigner.uilabel(app.UIFigure)\n            app.yLabel_C.Position = [303,154,67,24]\n            app.yLabel_C.Text = raw\"容值 [μF]\"\n            app.yLabel_C.HorizontalAlignment = raw\"center\"\n            app.yLabel_C.VerticalAlignment = raw\"center\"\n            app.yLabel_C.WordWrap = false\n\n            # Create xLabel_C\n            app.xLabel_C = TyAppDesigner.uilabel(app.UIFigure)\n            app.xLabel_C.Position = [536,267,63,24]\n            app.xLabel_C.Text = raw\"时间 [s]\"\n\n            # Create yLabel_R\n            app.yLabel_R = TyAppDesigner.uilabel(app.UIFigure)\n            app.yLabel_R.Position = [303,443,67,24]\n            app.yLabel_R.Text = raw\"阻值 [mΩ]\"\n            app.yLabel_R.HorizontalAlignment = raw\"center\"\n            app.yLabel_R.VerticalAlignment = raw\"center\"\n            app.yLabel_R.WordWrap = false\n\n            # Create xLabel_R\n            app.xLabel_R = TyAppDesigner.uilabel(app.UIFigure)\n            app.xLabel_R.Position = [536,550,63,24]\n            app.xLabel_R.Text = raw\"时间 [s]\"\n\n            # Create EditField_EqTime\n            app.EditField_EqTime = TyAppDesigner.uinumericeditfield(app.UIFigure)\n            app.EditField_EqTime.Position = [58,396,190,24]\n            app.EditField_EqTime.Label = raw\"等效运行时间 [年]\"\n            app.EditField_EqTime.HorizontalAlignment = raw\"center\"\n\n            # Create Btn_Status_C\n            app.Btn_Status_C = TyAppDesigner.uibutton(app.UIFigure)\n            app.Btn_Status_C.Position = [160,230,38,32]\n            app.Btn_Status_C.Text = raw\"正常\"\n\n            # Create Btn_Status_Rc\n            app.Btn_Status_Rc = TyAppDesigner.uibutton(app.UIFigure)\n            app.Btn_Status_Rc.Position = [160,305,38,32]\n            app.Btn_Status_Rc.Text = raw\"正常\"\n\n            # Create Label_C\n            app.Label_C = TyAppDesigner.uilabel(app.UIFigure)\n            app.Label_C.Position = [103,234,50,24]\n            app.Label_C.Text = raw\"电容C\"\n\n            # Create Label_R\n            app.Label_R = TyAppDesigner.uilabel(app.UIFigure)\n            app.Label_R.Position = [102,309,52,24]\n            app.Label_R.Text = raw\"电阻Rc\"\n\n            # Show the figure after all components are created\n            app.UIFigure.Visible= true\n        end\n\n        # App creation\n        function initApp(app)\n            # Create UIFigure and components\n            app.createComponents()\n\n            # Register the app with App Designer\n            TyAppDesigner.registerApp(app, app.UIFigure)\n\n            return app\n        end\n\n        # App deletion\n        function delete(app)\n            # Delete UIFigure when app is deleted\n            TyAppDesigner.delete(app, app.UIFigure)\n        end\n    end\n\n    # Create an APP instance\n    Instance = App().initApp()\nend"
+}
